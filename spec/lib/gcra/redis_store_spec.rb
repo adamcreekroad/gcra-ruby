@@ -1,27 +1,30 @@
+# frozen_string_literal: true
+
 require 'spec_helper'
-require 'redis'
 require 'digest/sha1'
 require_relative '../../../lib/gcra/rate_limiter'
 require_relative '../../../lib/gcra/redis_store'
 
 RSpec.describe GCRA::RedisStore do
   # Needs redis running on localhost:6379 (default port)
-  let(:redis)      { Redis.new }
+  let(:redis)      { RedisClient.new }
   let(:key_prefix) { 'gcra-ruby-specs:' }
   let(:options)    { {} }
   let(:store)      { described_class.new(redis, key_prefix, options) }
 
   def cleanup_redis
-    keys = redis.keys("#{key_prefix}*")
+    keys = redis.call('KEYS', "#{key_prefix}*")
     unless keys.empty?
-      redis.del(keys)
+      redis.call('DEL', keys)
     end
   end
 
   before do
+    allow(redis).to receive(:call).and_call_original
+
     begin
-      redis.ping
-    rescue Redis::CannotConnectError
+      redis.call('PING')
+    rescue RedisClient::CannotConnectError
       pending('Redis is not running on localhost:6379, skipping')
     end
 
@@ -41,7 +44,7 @@ RSpec.describe GCRA::RedisStore do
 
   describe '#get_with_time' do
     it 'with a value set, returns time and value' do
-      redis.set('gcra-ruby-specs:foo', 1_485_422_362_766_819_000)
+      redis.call('SET', 'gcra-ruby-specs:foo', 1_485_422_362_766_819_000)
 
       value, time = store.get_with_time('foo')
 
@@ -61,7 +64,7 @@ RSpec.describe GCRA::RedisStore do
 
   describe '#set_if_not_exists_with_ttl' do
     it 'with an existing key, returns false' do
-      redis.set('gcra-ruby-specs:foo', 1_485_422_362_766_819_000)
+      redis.call('SET', 'gcra-ruby-specs:foo', 1_485_422_362_766_819_000)
 
       did_set = store.set_if_not_exists_with_ttl('foo', 2_000_000_000_000_000_000, 1)
 
@@ -69,11 +72,11 @@ RSpec.describe GCRA::RedisStore do
     end
 
     it 'with a readonly host and no readonly configured' do
-      exception = Redis::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
+      exception = RedisClient::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
 
       expect(redis)
-        .to receive(:set)
-              .with('gcra-ruby-specs:foo', 2_000_000_000_000_000_000, nx: true, px: 1)
+        .to receive(:call)
+              .with('SET', 'gcra-ruby-specs:foo', 2_000_000_000_000_000_000, nx: true, px: 1)
               .and_raise(exception)
 
       expect do
@@ -89,20 +92,20 @@ RSpec.describe GCRA::RedisStore do
       end
 
       it 'with a readonly host' do
-        exception = Redis::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
+        exception = RedisClient::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
 
-        expect(redis.client)
+        expect(redis.send(:raw_connection))
           .to receive(:reconnect)
                 .and_call_original
 
         expect(redis)
-          .to receive(:set)
-                .with('gcra-ruby-specs:foo', 2_000_000_000_000_000_000, nx: true, px: 1)
+          .to receive(:call)
+                .with('SET', 'gcra-ruby-specs:foo', 2_000_000_000_000_000_000, nx: true, px: 1)
                 .and_raise(exception)
 
         expect(redis)
-          .to receive(:set)
-                .with('gcra-ruby-specs:foo', 2_000_000_000_000_000_000, nx: true, px: 1)
+          .to receive(:call)
+                .with('SET', 'gcra-ruby-specs:foo', 2_000_000_000_000_000_000, nx: true, px: 1)
                 .and_call_original
 
         store.set_if_not_exists_with_ttl('foo', 2_000_000_000_000_000_000, 1)
@@ -115,8 +118,8 @@ RSpec.describe GCRA::RedisStore do
       )
 
       expect(did_set).to eq(true)
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be > 8
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be <= 10
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be > 8
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be <= 10
     end
 
     it 'with a very low ttl (less than 1ms)' do
@@ -125,7 +128,7 @@ RSpec.describe GCRA::RedisStore do
       )
 
       expect(did_set).to eq(true)
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be <= 1
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be <= 1
     end
   end
 
@@ -136,79 +139,83 @@ RSpec.describe GCRA::RedisStore do
       )
 
       expect(swapped).to eq(false)
-      expect(redis.get('gcra-ruby-specs:foo')).to be_nil
+      expect(redis.call('GET', 'gcra-ruby-specs:foo')).to be_nil
     end
 
     it 'with an existing key and not matching old value, returns false' do
-      redis.set('gcra-ruby-specs:foo', 1_485_422_362_766_819_000)
+      redis.call('SET', 'gcra-ruby-specs:foo', 1_485_422_362_766_819_000)
 
       swapped = store.compare_and_set_with_ttl(
         'foo', 2_000_000_000_000_000_000, 3_000_000_000_000_000_000, 10 * 1_000_000_000
       )
 
       expect(swapped).to eq(false)
-      expect(redis.get('gcra-ruby-specs:foo')).to eq('1485422362766819000')
+      expect(redis.call('GET', 'gcra-ruby-specs:foo')).to eq('1485422362766819000')
     end
 
     it 'with an existing key and matching old value, returns true' do
-      redis.set('gcra-ruby-specs:foo', 2_000_000_000_000_000_000)
+      redis.call('SET', 'gcra-ruby-specs:foo', 2_000_000_000_000_000_000)
 
       swapped = store.compare_and_set_with_ttl(
         'foo', 2_000_000_000_000_000_000, 3_000_000_000_000_000_000, 10 * 1_000_000_000
       )
 
       expect(swapped).to eq(true)
-      expect(redis.get('gcra-ruby-specs:foo')).to eq('3000000000000000000')
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be > 8
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be <= 10
+      expect(redis.call('GET', 'gcra-ruby-specs:foo')).to eq('3000000000000000000')
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be > 8
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be <= 10
     end
 
     it 'with an existing key and a very low ttl (less than 1ms)' do
-      redis.set('gcra-ruby-specs:foo', 2_000_000_000_000_000_000)
+      redis.call('SET', 'gcra-ruby-specs:foo', 2_000_000_000_000_000_000)
 
       swapped = store.compare_and_set_with_ttl(
         'foo', 2_000_000_000_000_000_000, 3_000_000_000_000_000_000, 100
       )
 
       expect(swapped).to eq(true)
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be <= 1
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be <= 1
     end
 
     it 'handles the script cache being purged (gracefully reloads script)' do
-      redis.set('gcra-ruby-specs:foo', 2_000_000_000_000_000_000)
+      redis.call('SET', 'gcra-ruby-specs:foo', 2_000_000_000_000_000_000)
 
       swapped = store.compare_and_set_with_ttl(
         'foo', 2_000_000_000_000_000_000, 3_000_000_000_000_000_000, 10 * 1_000_000_000
       )
 
       expect(swapped).to eq(true)
-      expect(redis.get('gcra-ruby-specs:foo')).to eq('3000000000000000000')
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be > 8
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be <= 10
+      expect(redis.call('GET', 'gcra-ruby-specs:foo')).to eq('3000000000000000000')
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be > 8
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be <= 10
 
       # purge the script cache, this will trigger an exception branch that reloads the script
-      redis.script('flush')
+      redis.call('SCRIPT', 'FLUSH')
 
       swapped = store.compare_and_set_with_ttl(
         'foo', 3_000_000_000_000_000_000, 4_000_000_000_000_000_000, 10 * 1_000_000_000
       )
 
       expect(swapped).to eq(true)
-      expect(redis.get('gcra-ruby-specs:foo')).to eq('4000000000000000000')
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be > 8
-      expect(redis.ttl('gcra-ruby-specs:foo')).to be <= 10
+      expect(redis.call('GET', 'gcra-ruby-specs:foo')).to eq('4000000000000000000')
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be > 8
+      expect(redis.call('TTL', 'gcra-ruby-specs:foo')).to be <= 10
     end
 
     context 'with reconnect on readonly not configured' do
       it 'raises an error when the request is executed against a readonly host' do
-        exception = Redis::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
+        exception = RedisClient::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
 
         expect(redis)
-          .to receive(:evalsha)
+          .to receive(:call)
                 .with(
+                  'EVALSHA',
                   GCRA::RedisStore::CAS_SHA,
-                  keys: ['gcra-ruby-specs:foo'],
-                  argv: [3000000000000000000, 4000000000000000000, 10000],
+                  1,
+                  'gcra-ruby-specs:foo',
+                  3000000000000000000,
+                  4000000000000000000,
+                  10000,
                 )
                 .and_raise(exception)
 
@@ -231,27 +238,35 @@ RSpec.describe GCRA::RedisStore do
       end
 
       it 'attempts a reconnect once and then executes evalsha again' do
-        exception = Redis::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
+        exception = RedisClient::CommandError.new(GCRA::RedisStore::CONNECTED_TO_READONLY)
 
-        expect(redis.client)
+        expect(redis.send(:raw_connection))
           .to receive(:reconnect)
                 .and_call_original
 
         expect(redis)
-          .to receive(:evalsha)
+          .to receive(:call)
                 .with(
+                  'EVALSHA',
                   GCRA::RedisStore::CAS_SHA,
-                  keys: ['gcra-ruby-specs:foo'],
-                  argv: [3000000000000000000, 4000000000000000000, 10000],
+                  1,
+                  'gcra-ruby-specs:foo',
+                  3000000000000000000,
+                  4000000000000000000,
+                  10000,
                 )
                 .and_raise(exception)
 
         expect(redis)
-          .to receive(:evalsha)
+          .to receive(:call)
                 .with(
+                  'EVALSHA',
                   GCRA::RedisStore::CAS_SHA,
-                  keys: ['gcra-ruby-specs:foo'],
-                  argv: [3000000000000000000, 4000000000000000000, 10000],
+                  1,
+                  'gcra-ruby-specs:foo',
+                  3000000000000000000,
+                  4000000000000000000,
+                  10000,
                 )
 
         store.compare_and_set_with_ttl(

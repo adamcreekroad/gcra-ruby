@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module GCRA
-  VERSION = '1.2.1'.freeze
+  VERSION = '2.0.0'
 end

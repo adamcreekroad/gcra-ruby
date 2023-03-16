@@ -1,24 +1,28 @@
+# frozen_string_literal: true
+
+require 'redis-client'
+
 module GCRA
   # Redis store, expects all timestamps and durations to be integers with nanoseconds since epoch.
   class RedisStore
-    CAS_SCRIPT = <<-EOF.freeze
-  local v = redis.call('get', KEYS[1])
-  if v == false then
-    return redis.error_reply("key does not exist")
-  end
-  if v ~= ARGV[1] then
-    return 0
-  end
-  redis.call('psetex', KEYS[1], ARGV[3], ARGV[2])
-  return 1
-  EOF
+    CAS_SCRIPT = <<~LUA
+      local v = redis.call('get', KEYS[1])
+      if v == false then
+        return redis.error_reply("key does not exist")
+      end
+      if v ~= ARGV[1] then
+        return 0
+      end
+      redis.call('psetex', KEYS[1], ARGV[3], ARGV[2])
+      return 1
+    LUA
 
     # Digest::SHA1.hexdigest(CAS_SCRIPT)
-    CAS_SHA = "89118e702230c0d65969c5fc557a6e942a2f4d31".freeze
-    CAS_SCRIPT_MISSING_KEY_RESPONSE = 'key does not exist'.freeze
-    SCRIPT_NOT_IN_CACHE_RESPONSE = 'NOSCRIPT No matching script. Please use EVAL.'.freeze
+    CAS_SHA = '925e92682083f854e28ca3344eeb13820015453a'
+    CAS_SCRIPT_MISSING_KEY_RESPONSE = 'key does not exist'
+    SCRIPT_NOT_IN_CACHE_RESPONSE = 'NOSCRIPT No matching script. Please use EVAL.'
 
-    CONNECTED_TO_READONLY = "READONLY You can't write against a read only slave.".freeze
+    CONNECTED_TO_READONLY = "READONLY You can't write against a read only slave."
 
     def initialize(redis, key_prefix, options = {})
       @redis = redis
@@ -31,8 +35,8 @@ module GCRA
     # Also returns the time from the Redis server, with microsecond precision.
     def get_with_time(key)
       time_response, value = @redis.pipelined do |pipeline|
-        pipeline.time # returns tuple (seconds since epoch, microseconds)
-        pipeline.get(@key_prefix + key)
+        pipeline.call('TIME') { |t| t.map(&:to_i) } # returns tuple (seconds since epoch, microseconds)
+        pipeline.call('GET', @key_prefix + key)
       end
       # Convert tuple to nanoseconds
       time = (time_response[0] * 1_000_000 + time_response[1]) * 1_000
@@ -50,10 +54,10 @@ module GCRA
       retried = false
       begin
         ttl_milli = calculate_ttl_milli(ttl_nano)
-        @redis.set(full_key, value, nx: true, px: ttl_milli)
-      rescue Redis::CommandError => e
+        @redis.call('SET', full_key, value, nx: true, px: ttl_milli) == 'OK'
+      rescue RedisClient::CommandError => e
         if e.message == CONNECTED_TO_READONLY && @reconnect_on_readonly && !retried
-          @redis.client.reconnect
+          @redis.send(:raw_connection).reconnect
           retried = true
           retry
         end
@@ -69,16 +73,16 @@ module GCRA
       retried = false
       begin
         ttl_milli = calculate_ttl_milli(ttl_nano)
-        swapped = @redis.evalsha(CAS_SHA, keys: [full_key], argv: [old_value, new_value, ttl_milli])
-      rescue Redis::CommandError => e
+        swapped = @redis.call('EVALSHA', CAS_SHA, 1, full_key, old_value, new_value, ttl_milli)
+      rescue RedisClient::CommandError => e
         if e.message == CAS_SCRIPT_MISSING_KEY_RESPONSE
           return false
         elsif e.message == SCRIPT_NOT_IN_CACHE_RESPONSE && !retried
-          @redis.script('load', CAS_SCRIPT)
+          @redis.call('SCRIPT', 'LOAD', CAS_SCRIPT)
           retried = true
           retry
         elsif e.message == CONNECTED_TO_READONLY && @reconnect_on_readonly && !retried
-          @redis.client.reconnect
+          @redis.send(:raw_connection).reconnect
           retried = true
           retry
         end
