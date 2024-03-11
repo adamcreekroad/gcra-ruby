@@ -19,10 +19,15 @@ module GCRA
 
     # Digest::SHA1.hexdigest(CAS_SCRIPT)
     CAS_SHA = '925e92682083f854e28ca3344eeb13820015453a'
+
     CAS_SCRIPT_MISSING_KEY_RESPONSE = 'key does not exist'
+    CAS_SCRIPT_MISSING_KEY_RESPONSE_REGEX = /\A#{CAS_SCRIPT_MISSING_KEY_RESPONSE}/.freeze
+
     SCRIPT_NOT_IN_CACHE_RESPONSE = 'NOSCRIPT No matching script. Please use EVAL.'
+    SCRIPT_NOT_IN_CACHE_RESPONSE_REGEX = /\A#{SCRIPT_NOT_IN_CACHE_RESPONSE}/.freeze
 
     CONNECTED_TO_READONLY = "READONLY You can't write against a read only slave."
+    CONNECTED_TO_READONLY_REGEX = /\A#{CONNECTED_TO_READONLY}/.freeze
 
     def initialize(redis, key_prefix, options = {})
       @redis = redis
@@ -56,7 +61,7 @@ module GCRA
         ttl_milli = calculate_ttl_milli(ttl_nano)
         @redis.call('SET', full_key, value, nx: true, px: ttl_milli) == 'OK'
       rescue RedisClient::CommandError => e
-        if e.message == CONNECTED_TO_READONLY && @reconnect_on_readonly && !retried
+        if e.message.match?(CONNECTED_TO_READONLY_REGEX) && @reconnect_on_readonly && !retried
           @redis.send(:raw_connection).reconnect
           retried = true
           retry
@@ -75,13 +80,13 @@ module GCRA
         ttl_milli = calculate_ttl_milli(ttl_nano)
         swapped = @redis.call('EVALSHA', CAS_SHA, 1, full_key, old_value, new_value, ttl_milli)
       rescue RedisClient::CommandError => e
-        if e.message == CAS_SCRIPT_MISSING_KEY_RESPONSE
+        if e.message.match?(CAS_SCRIPT_MISSING_KEY_RESPONSE_REGEX)
           return false
-        elsif e.message == SCRIPT_NOT_IN_CACHE_RESPONSE && !retried
+        elsif e.message.match?(SCRIPT_NOT_IN_CACHE_RESPONSE_REGEX) && !retried
           @redis.call('SCRIPT', 'LOAD', CAS_SCRIPT)
           retried = true
           retry
-        elsif e.message == CONNECTED_TO_READONLY && @reconnect_on_readonly && !retried
+        elsif e.message.match?(CONNECTED_TO_READONLY_REGEX) && @reconnect_on_readonly && !retried
           @redis.send(:raw_connection).reconnect
           retried = true
           retry
